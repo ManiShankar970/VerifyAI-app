@@ -14,12 +14,6 @@ function StatCard({ title, value, subtitle }) {
 
 /**
  * Helpers for TOTP-like code generation (demo)
- * - Uses Web Crypto API HMAC-SHA-256
- * - Counter = floor(now / 30s)
- * - Dynamic truncation to 6 digits
- *
- * Note: This is a demo-only client-side approach. In production, secrets and verification
- * should be handled on a secure server.
  */
 async function importKeyFromSecret(secretStr) {
   const enc = new TextEncoder();
@@ -34,10 +28,8 @@ async function importKeyFromSecret(secretStr) {
 }
 
 function counterToBuffer(counter) {
-  // 8-byte big-endian buffer
   const buf = new ArrayBuffer(8);
   const view = new DataView(buf);
-  // split high/low for JS 53-bit safe
   const high = Math.floor(counter / Math.pow(2, 32));
   const low = counter >>> 0;
   view.setUint32(0, high);
@@ -53,7 +45,6 @@ async function generateTotp(secretStr, timeStep = 30, digits = 6) {
     const sig = await crypto.subtle.sign('HMAC', key, counterBuf);
     const bytes = new Uint8Array(sig);
 
-    // dynamic truncation (RFC) — works similarly for SHA-256
     const offset = bytes[bytes.length - 1] & 0x0f;
     const binary =
       ((bytes[offset] & 0x7f) << 24) |
@@ -71,12 +62,97 @@ async function generateTotp(secretStr, timeStep = 30, digits = 6) {
 }
 
 function generateRandomHexSecret(len = 32) {
-  // len bytes -> hex length = 2*len
   const arr = new Uint8Array(len);
   crypto.getRandomValues(arr);
   return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+/**
+ * PhotoUpload Component
+ */
+function PhotoUpload({ activeUser, setActiveUser }) {
+  const [photos, setPhotos] = useState([]);
+
+  useEffect(() => {
+    if (!activeUser) return;
+    const usersRaw = localStorage.getItem('verifyai_users') || '[]';
+    const users = JSON.parse(usersRaw);
+    const user = users.find(u => u.id === activeUser.id);
+    setPhotos(user?.photos || []);
+  }, [activeUser]);
+
+  const handleFiles = (e) => {
+    const files = Array.from(e.target.files);
+    if (photos.length + files.length > 3) {
+      alert('You can upload a maximum of 3 photos.');
+      return;
+    }
+
+    const readers = files.map(file =>
+      new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.readAsDataURL(file);
+      })
+    );
+
+    Promise.all(readers).then(results => {
+      const updatedPhotos = [...photos, ...results];
+      setPhotos(updatedPhotos);
+      savePhotos(updatedPhotos);
+    });
+  };
+
+  const removePhoto = (index) => {
+    const updatedPhotos = photos.filter((_, i) => i !== index);
+    setPhotos(updatedPhotos);
+    savePhotos(updatedPhotos);
+  };
+
+  const savePhotos = (photoArray) => {
+    const usersRaw = localStorage.getItem('verifyai_users') || '[]';
+    const users = JSON.parse(usersRaw);
+    const idx = users.findIndex(u => u.id === activeUser.id);
+    if (idx !== -1) {
+      users[idx].photos = photoArray;
+      localStorage.setItem('verifyai_users', JSON.stringify(users));
+      localStorage.setItem('verifyai_user_active', JSON.stringify(users[idx]));
+      setActiveUser(users[idx]);
+    }
+  };
+
+  return (
+    <div className="bg-white rounded-xl shadow p-4 mt-6">
+      <h4 className="font-semibold mb-3">Upload Protected Photos</h4>
+      <input
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={handleFiles}
+        disabled={photos.length >= 3}
+        className="mb-3"
+      />
+      <div className="flex space-x-3 flex-wrap">
+        {photos.map((photo, idx) => (
+          <div key={idx} className="relative w-24 h-24 border rounded overflow-hidden">
+            <img src={photo} alt={`photo-${idx}`} className="w-full h-full object-cover" />
+            <button
+              onClick={() => removePhoto(idx)}
+              className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs"
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
+      <div className="text-xs text-slate-400 mt-2">You can upload 1–3 photos for protection.</div>
+    </div>
+  );
+}
+
+/**
+ * Dashboard Component
+ */
 export default function Dashboard() {
   const userRaw = localStorage.getItem('verifyai_user_active');
   const user = userRaw ? JSON.parse(userRaw) : null;
@@ -84,35 +160,23 @@ export default function Dashboard() {
   const [totp, setTotp] = useState({ code: '------', secondsRemaining: 30 });
   const intervalRef = useRef(null);
 
-  // On mount: ensure user has a secret; generate & persist if missing
   useEffect(() => {
     if (!activeUser) return;
 
-    let updated = false;
     const usersRaw = localStorage.getItem('verifyai_users');
     const users = usersRaw ? JSON.parse(usersRaw) : [];
     if (!activeUser.secret) {
-      // create a secure random secret (hex)
-      const secret = generateRandomHexSecret(20); // 20 bytes -> 40 hex chars
+      const secret = generateRandomHexSecret(20);
       const newUser = { ...activeUser, secret };
       setActiveUser(newUser);
-      // update in localStorage users array
-      const foundIdx = users.findIndex(u => u.id === newUser.id);
-      if (foundIdx !== -1) {
-        users[foundIdx] = newUser;
-      } else {
-        users.push(newUser);
-      }
+      const idx = users.findIndex(u => u.id === newUser.id);
+      if (idx !== -1) users[idx] = newUser;
+      else users.push(newUser);
       localStorage.setItem('verifyai_users', JSON.stringify(users));
       localStorage.setItem('verifyai_user_active', JSON.stringify(newUser));
-      updated = true;
     }
+  }, []);
 
-    // if updated, totp generation below will use new secret on next tick
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [/* run once on mount */]);
-
-  // TOTP update every second (refresh code when counter crosses 30s)
   useEffect(() => {
     let mounted = true;
     async function tick() {
@@ -122,9 +186,7 @@ export default function Dashboard() {
       setTotp(out);
     }
 
-    // initial
     tick();
-
     intervalRef.current = setInterval(tick, 1000);
     return () => {
       mounted = false;
@@ -135,7 +197,6 @@ export default function Dashboard() {
   const copyCode = async () => {
     try {
       await navigator.clipboard.writeText(totp.code);
-      // small ephemeral feedback
       const el = document.createElement('div');
       el.innerText = 'Copied!';
       el.className = 'fixed right-6 top-20 bg-slate-900 text-white px-3 py-1 rounded shadow';
@@ -164,12 +225,12 @@ export default function Dashboard() {
               <StatCard title="Unauthorized Attempts" value="4" subtitle="Last 30 days" />
             </div>
 
+            {/* Activity & Alerts */}
             <div className="bg-white rounded-xl shadow p-6">
               <div className="flex items-center justify-between">
                 <h3 className="font-semibold text-lg">Activity & Alerts</h3>
                 <div className="text-sm text-slate-500">Most recent</div>
               </div>
-
               <ul className="mt-4 space-y-3">
                 {recent.map(r => (
                   <li key={r.id} className="flex items-start space-x-3">
@@ -183,7 +244,9 @@ export default function Dashboard() {
               </ul>
             </div>
 
-            {/* Removed global Media Upload area per your request */}
+            {/* Photo Upload */}
+            <PhotoUpload activeUser={activeUser} setActiveUser={setActiveUser} />
+
           </div>
 
           {/* Right / Sidebar */}
@@ -200,9 +263,7 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* Upload controls moved into Profile area */}
               <div className="mt-6">
-
                 <div className="bg-slate-50 border border-slate-100 rounded-lg p-3">
                   <div className="flex items-center justify-between">
                     <div>
@@ -234,7 +295,6 @@ export default function Dashboard() {
                 <div className="mt-2 space-y-2">
                   <button
                     onClick={() => {
-                      // reset secret for demo
                       if (!confirm('Reset your per-user secret? This will invalidate existing codes. Proceed (demo)?')) return;
                       const usersRaw = localStorage.getItem('verifyai_users') || '[]';
                       const users = JSON.parse(usersRaw);
